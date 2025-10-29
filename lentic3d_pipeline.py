@@ -6,12 +6,24 @@ import argparse
 import json
 import math
 import os
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import cv2
 import numpy as np
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_SOURCE_IMAGE = SCRIPT_DIR / "examplePhoto.JPG"
+DEFAULT_MIDAS_MODEL = SCRIPT_DIR / "midas_v21_small_256.onnx"
+DEFAULT_DEPTH_ANYTHING_MODEL = SCRIPT_DIR / "depth_anything_v2_small.pth"
+
+
+def _as_existing(path: Path, description: str) -> Path:
+    if not path.exists():
+        raise FileNotFoundError(f"Expected {description} at {path}")
+    return path
 
 
 @dataclass
@@ -23,6 +35,7 @@ class PipelineMetadata:
     radius: float
     knob_degrees: float
     lenticule_width: int
+    models: Dict[str, str] = field(default_factory=dict)
 
     def to_json(self) -> Dict[str, object]:
         data = asdict(self)
@@ -37,6 +50,7 @@ class PipelineMetadata:
             radius=float(data.get("radius", 0.0)),
             knob_degrees=float(data.get("knob_degrees", 0.0)),
             lenticule_width=int(data.get("lenticule_width", 1)),
+            models={k: str(v) for k, v in data.get("models", {}).items()},
         )
 
 
@@ -48,10 +62,18 @@ def parse_args() -> argparse.Namespace:
             "creates rotated views, and interlaces them into a printable composite."
         )
     )
-    parser.add_argument("source", help="Path to the source image (RGB/BGR)")
+    parser.add_argument(
+        "source",
+        nargs="?",
+        default=str(DEFAULT_SOURCE_IMAGE),
+        help=(
+            "Path to the source image (RGB/BGR). If omitted the bundled example photo "
+            "located next to this script will be used."
+        ),
+    )
     parser.add_argument(
         "--output-dir",
-        default="outputs",
+        default=str(SCRIPT_DIR / "outputs"),
         help="Directory where generated images and metadata will be stored.",
     )
     parser.add_argument(
@@ -77,6 +99,22 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional path to write metadata JSON. Defaults to <output-dir>/metadata.json.",
     )
+    parser.add_argument(
+        "--midas-model",
+        default=str(DEFAULT_MIDAS_MODEL),
+        help=(
+            "Path to the MiDaS model file. Defaults to the bundled ONNX model in the "
+            "same directory as this script."
+        ),
+    )
+    parser.add_argument(
+        "--depth-anything-model",
+        default=str(DEFAULT_DEPTH_ANYTHING_MODEL),
+        help=(
+            "Path to the Depth Anything v2 small checkpoint. Defaults to the bundled "
+            "PyTorch model next to this script."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -86,8 +124,20 @@ def ensure_output_dir(path: str) -> Path:
     return output_dir
 
 
-def load_image(path: str) -> np.ndarray:
-    image = cv2.imread(path, cv2.IMREAD_COLOR)
+def resolve_source_path(path_str: str) -> Path:
+    path = Path(path_str)
+    if path.exists():
+        return path
+
+    fallback = SCRIPT_DIR / path_str
+    if fallback.exists():
+        return fallback
+
+    raise FileNotFoundError(f"Unable to locate source image at {path_str}")
+
+
+def load_image(path: Path) -> np.ndarray:
+    image = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if image is None:
         raise FileNotFoundError(f"Unable to read image at {path}")
     return image
@@ -189,10 +239,14 @@ def interlace_views(views: Tuple[np.ndarray, np.ndarray, np.ndarray], lenticule_
 
 def main() -> None:
     args = parse_args()
+    midas_model = _as_existing(Path(args.midas_model), "MiDaS model")
+    depth_anything_model = _as_existing(Path(args.depth_anything_model), "Depth Anything model")
+
+    source_path = resolve_source_path(args.source)
+    image = load_image(source_path)
+
     output_dir = ensure_output_dir(args.output_dir)
     metadata_path = Path(args.metadata_json) if args.metadata_json else output_dir / "metadata.json"
-
-    image = load_image(args.source)
 
     existing_metadata = load_metadata(metadata_path)
 
@@ -214,18 +268,22 @@ def main() -> None:
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    source_name = Path(args.source).stem
+    source_name = source_path.stem
     cv2.imwrite(str(output_dir / f"{source_name}_left.png"), left_view)
     cv2.imwrite(str(output_dir / f"{source_name}_center.png"), center_view)
     cv2.imwrite(str(output_dir / f"{source_name}_right.png"), right_view)
     cv2.imwrite(str(output_dir / f"{source_name}_lenticular.png"), composite)
 
     metadata = PipelineMetadata(
-        source_image=os.path.abspath(args.source),
+        source_image=os.path.abspath(str(source_path)),
         bounding_box=bounding_box,
         radius=radius,
         knob_degrees=args.knob,
         lenticule_width=args.lenticule_width,
+        models={
+            "midas": str(midas_model),
+            "depth_anything_v2_small": str(depth_anything_model),
+        },
     )
     save_metadata(metadata_path, metadata)
 
